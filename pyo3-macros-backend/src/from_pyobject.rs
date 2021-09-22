@@ -108,7 +108,7 @@ enum ContainerType<'a> {
     /// Tuple struct, e.g. `struct Foo(String)`.
     ///
     /// Fields are extracted from a tuple.
-    Tuple(usize),
+    Tuple(Vec<FieldPyO3Attributes>),
     /// Tuple newtype, e.g. `#[transparent] struct Foo(String)`
     ///
     /// The wrapped field is directly extracted from the object.
@@ -140,56 +140,65 @@ impl<'a> Container<'a> {
             !fields.is_empty(),
             fields.span() => "cannot derive FromPyObject for empty structs and variants"
         );
-        if options.transparent {
+
+        let first_field = match fields {
+            Fields::Unnamed(fields_unnamed) => &fields_unnamed.unnamed,
+            Fields::Named(fields_named) => &fields_named.named,
+            Fields::Unit => unreachable!(), // covered by length check above
+        }
+        .iter()
+        .next()
+        .expect("Check for len 1 is done above");
+        let first_field_has_pyo3_attrs = first_field.attrs.iter().any(|attr| {
+            get_pyo3_options::<FieldPyO3Attribute>(attr)
+                .unwrap_or_default()
+                .is_some()
+        });
+
+        let style = if options.transparent || (fields.len() == 1 && !first_field_has_pyo3_attrs) {
             ensure_spanned!(
                 fields.len() == 1,
                 fields.span() => "transparent structs and variants can only have 1 field"
             );
-        }
-        let style = match (fields, options.transparent) {
-            (Fields::Unnamed(_), true) => ContainerType::TupleNewtype,
-            (Fields::Unnamed(unnamed), false) => match unnamed.unnamed.len() {
-                1 => ContainerType::TupleNewtype,
-                len => ContainerType::Tuple(len),
-            },
-            (Fields::Named(named), true) => {
-                let field = named
-                    .named
-                    .iter()
-                    .next()
-                    .expect("Check for len 1 is done above");
-                let ident = field
-                    .ident
-                    .as_ref()
-                    .expect("Named fields should have identifiers");
-                ContainerType::StructNewtype(ident)
+            ensure_spanned!(!first_field_has_pyo3_attrs,
+                first_field.span() => "transparent struct fields cannot have pyo3 attrs"
+            );
+            match first_field.ident.as_ref() {
+                Some(ident) => ContainerType::StructNewtype(ident),
+                _ => ContainerType::TupleNewtype,
             }
-            (Fields::Named(named), false) => {
-                let mut fields = Vec::new();
-                for field in named.named.iter() {
-                    let ident = field
-                        .ident
-                        .as_ref()
-                        .expect("Named fields should have identifiers");
-                    let attrs = FieldPyO3Attributes::from_attrs(&field.attrs)?;
-                    fields.push((ident, attrs))
-                }
-                ContainerType::Struct(fields)
+        } else {
+            match fields {
+                Fields::Unnamed(f) => ContainerType::Tuple({
+                    f.unnamed
+                        .iter()
+                        .map(|field| FieldPyO3Attributes::from_attrs(&field.attrs))
+                        .collect::<Result<_>>()?
+                }),
+                Fields::Named(f) => ContainerType::Struct({
+                    f.named
+                        .iter()
+                        .map(|field| {
+                            let attrs = FieldPyO3Attributes::from_attrs(&field.attrs);
+                            let ident = field.ident.expect("Named fields should have identifiers");
+                            attrs.map(|a| (&ident, a))
+                        })
+                        .collect::<Result<_>>()?
+                }),
+                Fields::Unit => unreachable!(), // covered by length check above
             }
-            (Fields::Unit, _) => unreachable!(), // covered by length check above
         };
+
         let err_name = options.annotation.map_or_else(
             || path.segments.last().unwrap().ident.to_string(),
             |lit_str| lit_str.value(),
         );
-
-        let v = Container {
+        Ok(Container {
             path,
             ty: style,
             err_name,
             is_enum_variant,
-        };
-        Ok(v)
+        })
     }
 
     /// Build derivation body for a struct.
@@ -197,7 +206,7 @@ impl<'a> Container<'a> {
         match &self.ty {
             ContainerType::StructNewtype(ident) => self.build_newtype_struct(Some(ident)),
             ContainerType::TupleNewtype => self.build_newtype_struct(None),
-            ContainerType::Tuple(len) => self.build_tuple_struct(*len),
+            ContainerType::Tuple(attrs) => self.build_tuple_struct(attrs),
             ContainerType::Struct(tups) => self.build_struct(tups),
         }
     }
@@ -210,13 +219,9 @@ impl<'a> Container<'a> {
                 quote!(#self_ty),
                 quote!(#ident)
             );
+            let map_err = build_map_err(&error_msg);
             quote!(
-                ::std::result::Result::Ok(#self_ty{#ident: obj.extract().map_err(|inner| {
-                    let py = ::pyo3::PyNativeType::py(obj);
-                    let new_err = ::pyo3::exceptions::PyTypeError::new_err(#error_msg);
-                    new_err.set_cause(py, ::std::option::Option::Some(inner));
-                    new_err
-                })?})
+                ::std::result::Result::Ok(#self_ty{#ident: obj.extract().#map_err?})
             )
         } else {
             let error_msg = if self.is_enum_variant {
@@ -225,6 +230,7 @@ impl<'a> Container<'a> {
             } else {
                 format!("failed to extract inner field of {}", quote!(#self_ty))
             };
+            let map_err = build_map_err(&error_msg);
             quote!(
                 ::std::result::Result::Ok(#self_ty(obj.extract().map_err(|inner| {
                     let py = ::pyo3::PyNativeType::py(obj);
@@ -237,18 +243,22 @@ impl<'a> Container<'a> {
         }
     }
 
-    fn build_tuple_struct(&self, len: usize) -> TokenStream {
+    fn build_tuple_struct(&self, field_attrs: &[FieldPyO3Attributes]) -> TokenStream {
         let self_ty = &self.path;
         let mut fields: Punctuated<TokenStream, syn::Token![,]> = Punctuated::new();
-        for i in 0..len {
+        for (i, attrs) in field_attrs.iter().enumerate() {
+            let getter = match attrs.getter {
+                Some(FieldGetter::GetAttr(Some(name))) => quote!(getattr(#name)),
+                Some(FieldGetter::GetAttr(None)) => {
+                    todo!("panic")
+                }
+                Some(FieldGetter::GetItem(Some(key))) => quote!(get_item(#key)),
+                None | Some(FieldGetter::GetItem(None)) => quote!(get_item(#i)),
+            };
             let error_msg = format!("failed to extract field {}.{}", quote!(#self_ty), i);
+            let map_err = build_map_err(&error_msg);
             fields.push(quote!(
-                s.get_item(#i).and_then(::pyo3::types::PyAny::extract).map_err(|inner| {
-                let py = ::pyo3::PyNativeType::py(obj);
-                let new_err = ::pyo3::exceptions::PyTypeError::new_err(#error_msg);
-                new_err.set_cause(py, ::std::option::Option::Some(inner));
-                new_err
-                })?));
+                s.#getter?.and_then(::pyo3::types::PyAny::extract).#map_err?));
         }
         let msg = if self.is_enum_variant {
             quote!(::std::format!(
@@ -272,33 +282,19 @@ impl<'a> Container<'a> {
         let self_ty = &self.path;
         let mut fields: Punctuated<TokenStream, syn::Token![,]> = Punctuated::new();
         for (ident, attrs) in tups {
-            let getter = match &attrs.getter {
-                FieldGetter::GetAttr(Some(name)) => quote!(getattr(#name)),
-                FieldGetter::GetAttr(None) => quote!(getattr(stringify!(#ident))),
-                FieldGetter::GetItem(Some(key)) => quote!(get_item(#key)),
-                FieldGetter::GetItem(None) => quote!(get_item(stringify!(#ident))),
+            let getter = match attrs.getter {
+                Some(FieldGetter::GetAttr(Some(name))) => quote!(getattr(#name)),
+                None | Some(FieldGetter::GetAttr(None)) => quote!(getattr(stringify!(#ident))),
+                Some(FieldGetter::GetItem(Some(key))) => quote!(get_item(#key)),
+                Some(FieldGetter::GetItem(None)) => quote!(get_item(stringify!(#ident))),
             };
-            let conversion_error_msg =
-                format!("failed to extract field {}.{}", quote!(#self_ty), ident);
+            let error_msg = format!("failed to extract field {}.{}", quote!(#self_ty), ident);
+            let map_err = build_map_err(&error_msg);
             let get_field = quote!(obj.#getter?);
             let extractor = match &attrs.from_py_with {
-                None => quote!(
-                    #get_field.extract().map_err(|inner| {
-                    let py = ::pyo3::PyNativeType::py(obj);
-                    let new_err = ::pyo3::exceptions::PyTypeError::new_err(#conversion_error_msg);
-                    new_err.set_cause(py, ::std::option::Option::Some(inner));
-                    new_err
-                })?),
-                Some(FromPyWithAttribute(expr_path)) => quote! (
-                    #expr_path(#get_field).map_err(|inner| {
-                        let py = ::pyo3::PyNativeType::py(obj);
-                        let new_err = ::pyo3::exceptions::PyTypeError::new_err(#conversion_error_msg);
-                        new_err.set_cause(py, ::std::option::Option::Some(inner));
-                        new_err
-                    })?
-                ),
+                None => quote!(#get_field.extract().#map_err?),
+                Some(FromPyWithAttribute(path)) => quote!(#path(#get_field).#map_err?),
             };
-
             fields.push(quote!(#ident: #extractor));
         }
         quote!(::std::result::Result::Ok(#self_ty{#fields}))
@@ -370,9 +366,9 @@ impl ContainerOptions {
 }
 
 /// Attributes for deriving FromPyObject scoped on fields.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct FieldPyO3Attributes {
-    getter: FieldGetter,
+    getter: Option<FieldGetter>,
     from_py_with: Option<FromPyWithAttribute>,
 }
 
@@ -438,8 +434,7 @@ impl FieldPyO3Attributes {
     /// Extract the field attributes.
     ///
     fn from_attrs(attrs: &[Attribute]) -> Result<Self> {
-        let mut getter = None;
-        let mut from_py_with = None;
+        let mut out = Self::default();
 
         for attr in attrs {
             if let Some(pyo3_attrs) = get_pyo3_options(attr)? {
@@ -450,24 +445,21 @@ impl FieldPyO3Attributes {
                                 getter.is_none(),
                                 attr.span() => "only one of `attribute` or `item` can be provided"
                             );
-                            getter = Some(field_getter)
+                            out.getter = Some(field_getter)
                         }
                         FieldPyO3Attribute::FromPyWith(from_py_with_attr) => {
                             ensure_spanned!(
                                 from_py_with.is_none(),
                                 attr.span() => "`from_py_with` may only be provided once"
                             );
-                            from_py_with = Some(from_py_with_attr);
+                            out.from_py_with = Some(from_py_with_attr);
                         }
                     }
                 }
             }
         }
 
-        Ok(FieldPyO3Attributes {
-            getter: getter.unwrap_or(FieldGetter::GetAttr(None)),
-            from_py_with,
-        })
+        Ok(out)
     }
 }
 
@@ -533,4 +525,15 @@ pub fn build_derive_from_pyobject(tokens: &DeriveInput) -> Result<TokenStream> {
             }
         }
     ))
+}
+
+fn build_map_err(error_msg: &str) -> TokenStream {
+    quote!(
+        map_err(|inner| {
+            let py = ::pyo3::PyNativeType::py(obj);
+            let new_err = ::pyo3::exceptions::PyTypeError::new_err(#error_msg);
+            new_err.set_cause(py, ::std::option::Option::Some(inner));
+            new_err
+        })
+    )
 }
